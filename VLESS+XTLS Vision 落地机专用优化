@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# VLESS+XTLS Vision 落地机专用优化
+# 重点：BBR + FQ + MSS 钳制（无 IP 转发、无路由副作用）
+
+set -euo pipefail
+
+SYSCTL_CONF="/etc/sysctl.d/99-vision-landing.conf"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "[ERROR] 需要 root 权限运行。" >&2
+  exit 1
+fi
+
+echo "[*] Vision 落地机优化开始..."
+
+########## 1. 检查并启用 BBR（不可用则回退 cubic） ##########
+echo "[1/3] 检查内核是否支持 BBR..."
+CC="bbr"
+if ! (modprobe -n tcp_bbr 2>/dev/null && modprobe tcp_bbr 2>/dev/null); then
+  CC="cubic"
+  echo "  ⚠ 未检测到 tcp_bbr 模块，将使用 ${CC}（建议升级内核后再改回 BBR）"
+fi
+
+########## 2. 写入 sysctl 参数：BBR + FQ + 温和 TCP 优化 ##########
+echo "[2/3] 写入 ${SYSCTL_CONF} ..."
+
+cat > "${SYSCTL_CONF}" <<EOF
+# ===== Vision 落地机专用网络优化 =====
+
+# 文件描述符上限（适度）
+fs.file-max = 2097152
+
+# 队列 & 拥塞控制：fq + BBR/CUBIC
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = ${CC}
+
+# TCP 基础能力
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_timestamps = 1
+
+# ECN：如无特殊需求可先关（跨境链路更稳）
+net.ipv4.tcp_ecn = 0
+
+# MTU 探测（配合 MSS 钳制，进一步防止黑洞）
+net.ipv4.tcp_mtu_probing = 1
+
+# 关闭可能导致断流的 TFO
+net.ipv4.tcp_fastopen = 0
+
+# 缓冲区（适中，避免 OOM）
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+
+# 连接队列
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 8192
+
+# 不在这里开启任何 IP 转发，保持落地机安全、干净
+# 如需路由/NAT，请在单独脚本/配置中显式开启：
+# net.ipv4.ip_forward = 1
+# net.ipv4.conf.all.forwarding = 1
+# net.ipv6.conf.all.forwarding = 1
+
+# 一些常见安全/兼容项（不强制动，交给系统/防火墙）
+# 如有需要可以单独再加：
+# net.ipv4.conf.all.accept_redirects = 0
+# net.ipv4.conf.default.accept_redirects = 0
+# net.ipv4.conf.all.send_redirects = 0
+# net.ipv4.conf.default.send_redirects = 0
+# net.ipv4.conf.all.rp_filter = 0
+# net.ipv4.conf.default.rp_filter = 0
+
+# ===== END =====
+EOF
+
+echo "    - 应用 sysctl ..."
+sysctl -p "${SYSCTL_CONF}" >/dev/null
+
+########## 3. MSS 钳制（Vision / WireGuard / 隧道的关键） ##########
+echo "[3/3] 设置 MSS 钳制规则..."
+
+add_mss_rule_v4() {
+  local chain="$1"
+  if ! iptables -t mangle -C "${chain}" -p tcp --tcp-flags SYN,RST SYN \
+       -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+    iptables -t mangle -A "${chain}" -p tcp --tcp-flags SYN,RST SYN \
+      -j TCPMSS --clamp-mss-to-pmtu
+    echo "    - IPv4: mangle/${chain} 已添加 TCPMSS clamp 规则"
+  fi
+}
+
+add_mss_rule_v6() {
+  local chain="$1"
+  if ! ip6tables -t mangle -C "${chain}" -p tcp --tcp-flags SYN,RST SYN \
+       -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+    ip6tables -t mangle -A "${chain}" -p tcp --tcp-flags SYN,RST SYN \
+      -j TCPMSS --clamp-mss-to-pmtu
+    echo "    - IPv6: mangle/${chain} 已添加 TCPMSS clamp 规则"
+  fi
+}
+
+# IPv4：OUTPUT 必须（本机发出的 SYN/ACK），FORWARD 视情况而定，加上也无害
+if command -v iptables >/dev/null 2>&1; then
+  add_mss_rule_v4 OUTPUT   # 本机作为 Vision 落地的关键
+  add_mss_rule_v4 FORWARD  # 若未来做路由/NAT/TProxy，这条就直接生效
+fi
+
+# IPv6：按同样逻辑处理
+if command -v ip6tables >/dev/null 2>&1; then
+  add_mss_rule_v6 OUTPUT
+  add_mss_rule_v6 FORWARD
+fi
+
+echo
+echo "✅ Vision 落地机优化完成："
+echo "   - 队列：fq"
+echo "   - 拥塞控制：${CC}"
+echo "   - TCP Fast Open：已关闭"
+echo "   - MSS 钳制：IPv4/IPv6 OUTPUT+FORWARD 已配置（clamp-mss-to-pmtu）"
+echo
+echo "建议："
+echo "   - 如未来此机要做路由/NAT，再单独开启 ip_forward，而不要在本脚本里动。"
